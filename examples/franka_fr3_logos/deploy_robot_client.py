@@ -46,7 +46,7 @@ Example (sync):
         --task "pick up the soft toy and place it in the drawer" \
         --fps 10
 
-Example (with end-effector control):
+Example (with end-effector control, ROS2 path):
     python deploy_robot_client.py \
         --use_sync_inference \
         --use_ee \
@@ -54,6 +54,25 @@ Example (with end-effector control):
         --policy_type diffusion \
         --task "pick and place task" \
         --fps 10
+
+Example (ZMQ two-computer, joint obs + joint actions):
+    python deploy_robot_client.py \
+        --use_sync_inference \
+        --robot_server_address 192.168.1.100 \
+        --checkpoint_path outputs/train/act_franka_fr3_softtoy/checkpoints/last/pretrained_model \
+        --policy_type act \
+        --task "pick up the soft toy"
+
+Example (ZMQ two-computer, EE obs + EE actions):
+    python deploy_robot_client.py \
+        --use_sync_inference \
+        --robot_server_address 192.168.1.100 \
+        --obs_ee --action_ee \
+        --checkpoint_path outputs/train/diffusion_franka_fr3_ee/checkpoints/last/pretrained_model \
+        --policy_type diffusion \
+        --task "pick and place task"
+    # Note: to use delta EE actions, start the server with --delta_ee flag:
+    #   python franka_zmq_server.py --robot_ip 172.16.0.2 --delta_ee
 """
 
 import argparse
@@ -90,10 +109,28 @@ def main():
     
     # Franka FR3 configuration
     parser.add_argument(
-        "--robot_id", 
-        type=str, 
+        "--robot_id",
+        type=str,
         default="franka_fr3",
         help="Unique identifier for the robot (used for calibration files)"
+    )
+
+    # Two-computer ZMQ transport (Computer B → Computer A)
+    parser.add_argument(
+        "--robot_server_address",
+        type=str,
+        default=None,
+        help=(
+            "IP address of franka_zmq_server on the robot computer (Computer A). "
+            "When set, uses ZMQ transport instead of ROS2 (no ROS2 required on this machine). "
+            "Example: --robot_server_address 192.168.1.100"
+        ),
+    )
+    parser.add_argument(
+        "--robot_server_port",
+        type=int,
+        default=5555,
+        help="ZMQ port of franka_zmq_server (default: 5555)",
     )
     
     # Policy configuration
@@ -159,10 +196,22 @@ def main():
     )
     
     # Robot control space
+    # For ROS2 path (no --robot_server_address): --use_ee controls both obs and action space
     parser.add_argument(
         "--use_ee",
         action="store_true",
-        help="Use end-effector space instead of joint space (for policies trained on EE datasets)"
+        help="(ROS2 path) Use end-effector space for both observations and actions"
+    )
+    # For ZMQ path (--robot_server_address set): obs and action space are independent
+    parser.add_argument(
+        "--obs_ee",
+        action="store_true",
+        help="(ZMQ path) Observations are EE pose instead of joint positions"
+    )
+    parser.add_argument(
+        "--action_ee",
+        action="store_true",
+        help="(ZMQ path) Actions are EE targets instead of joint position targets"
     )
     
     # Inference mode
@@ -263,13 +312,29 @@ def main():
         else:
             camera_configs[hw_camera_name] = camera_config
     
-    # Create Franka FR3 robot configuration
-    robot_config = FrankaFR3Config(
-        id=args.robot_id,
-        cameras=camera_configs,
-        dt=1/args.fps,
-        use_ee=args.use_ee
-    )
+    # Create robot configuration — ZMQ transport (two-computer) or ROS2 (single-computer)
+    if args.robot_server_address:
+        from lerobot.robots.franka_fr3.franka_zmq_robot import FrankaZMQConfig
+        robot_config = FrankaZMQConfig(
+            id=args.robot_id,
+            cameras=camera_configs,
+            robot_server_address=args.robot_server_address,
+            robot_server_port=args.robot_server_port,
+            obs_ee=args.obs_ee,
+            action_ee=args.action_ee,
+        )
+        logger.info(
+            f"Using ZMQ transport → {args.robot_server_address}:{args.robot_server_port} | "
+            f"obs={'ee' if args.obs_ee else 'joint'} "
+            f"action={'ee' if args.action_ee else 'joint'}"
+        )
+    else:
+        robot_config = FrankaFR3Config(
+            id=args.robot_id,
+            cameras=camera_configs,
+            dt=1/args.fps,
+            use_ee=args.use_ee,
+        )
     
     # Add safety parameters if provided
     if args.max_relative_target is not None:
@@ -280,7 +345,11 @@ def main():
     logger.info("Franka FR3 Policy Deployment Client")
     logger.info("="*70)
     logger.info(f"Robot ID: {robot_config.id}")
-    logger.info(f"Control Space: {'End-Effector (EE)' if args.use_ee else 'Joint Space'}")
+    if args.robot_server_address:
+        logger.info(f"Obs Space:    {'EE' if args.obs_ee else 'Joint'}")
+        logger.info(f"Action Space: {'EE' if args.action_ee else 'Joint'}")
+    else:
+        logger.info(f"Control Space: {'End-Effector (EE)' if args.use_ee else 'Joint Space'}")
     logger.info(f"Policy Type: {args.policy_type.upper()}")
     logger.info(f"Policy Checkpoint: {checkpoint_path or 'Will be provided via command'}")
     logger.info(f"Policy Device: {args.policy_device}")

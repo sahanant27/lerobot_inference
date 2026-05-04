@@ -19,3 +19,4 @@
 
 from .config_franka_fr3 import FrankaFR3Config
 from .franka_fr3 import FrankaFR3
+from .franka_zmq_robot import FrankaZMQConfig, FrankaZMQRobot

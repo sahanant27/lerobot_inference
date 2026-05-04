@@ -64,6 +64,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .franka_fr3 import FrankaFR3
 
         return FrankaFR3(config)
+    elif config.type == "franka_zmq":
+        from .franka_fr3.franka_zmq_robot import FrankaZMQRobot
+
+        return FrankaZMQRobot(config)
     elif config.type == "openarm_follower":
         from .openarm_follower import OpenArmFollower
 
