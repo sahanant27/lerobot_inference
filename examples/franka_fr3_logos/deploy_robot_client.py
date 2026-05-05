@@ -83,6 +83,12 @@ def main():
     )
     parser.add_argument("--robot_server_port", type=int, default=5555)
     parser.add_argument("--robot_id", type=str, default="franka_fr3")
+    parser.add_argument("--zmq_timeout_ms", type=int, default=5000,
+                        help="Per-request ZMQ receive timeout in milliseconds.")
+    parser.add_argument("--zmq_max_retries", type=int, default=6,
+                        help="How many times to retry each ZMQ request.")
+    parser.add_argument("--zmq_retry_backoff_s", type=float, default=0.1,
+                        help="Sleep duration between ZMQ retries in seconds.")
 
     # Observation / action space
     parser.add_argument(
@@ -176,6 +182,9 @@ def main():
         cameras=camera_configs,
         robot_server_address=args.robot_server_address,
         robot_server_port=args.robot_server_port,
+        zmq_timeout_ms=args.zmq_timeout_ms,
+        zmq_max_retries=args.zmq_max_retries,
+        zmq_retry_backoff_s=args.zmq_retry_backoff_s,
         obs_ee=args.obs_ee,
         action_ee=args.action_ee,
     )
@@ -186,6 +195,8 @@ def main():
     logger.info("Franka FR3 ZMQ Policy Deployment")
     logger.info("=" * 70)
     logger.info(f"Robot:        {args.robot_server_address}:{args.robot_server_port}")
+    logger.info(f"ZMQ timeout:  {args.zmq_timeout_ms} ms")
+    logger.info(f"ZMQ retries:  {args.zmq_max_retries} (backoff {args.zmq_retry_backoff_s:.2f}s)")
     logger.info(f"Obs space:    {'EE' if args.obs_ee else 'Joint'}")
     logger.info(f"Action space: {'EE' if args.action_ee else 'Joint'}")
     logger.info(f"Policy type:  {args.policy_type.upper() or '(not set)'}")

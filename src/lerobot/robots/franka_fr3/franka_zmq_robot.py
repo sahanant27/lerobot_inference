@@ -64,7 +64,11 @@ class FrankaZMQConfig(RobotConfig):
     robot_server_address: str = "192.168.1.100"
     robot_server_port: int = 5555
     # ZMQ receive timeout in ms — raised as ConnectionError on expiry
-    zmq_timeout_ms: int = 2000
+    zmq_timeout_ms: int = 5000
+    # Number of retries per request before surfacing a ConnectionError.
+    zmq_max_retries: int = 6
+    # Sleep between retries (seconds), useful when server is briefly busy.
+    zmq_retry_backoff_s: float = 0.1
 
     # Joint names — must match the policy's expected feature keys
     joint_names: list[str] = field(default_factory=lambda: [
@@ -129,10 +133,19 @@ class FrankaZMQRobot(Robot):
             motors = {f"{n}.pos": float for n in self.config.ee_names}
         else:
             motors = {f"{j}.pos": float for j in self.config.joint_names}
+            # Add duplicate gripper for checkpoint compatibility (9 dims: 7 joints + 2 gripper)
+            motors["gripper_duplicate.pos"] = float
         cameras = {
             name: (cfg.height, cfg.width, 3)
             for name, cfg in self.config.cameras.items()
         }
+        front_shape = cameras.get("front_img")
+        wrist_shape = cameras.get("wrist_img")
+        if front_shape is not None:
+            cameras["base_0_rgb"] = front_shape
+        if wrist_shape is not None:
+            cameras["left_wrist_0_rgb"] = wrist_shape
+            cameras["right_wrist_0_rgb"] = wrist_shape
         return {**motors, **cameras}
 
     @cached_property
@@ -233,14 +246,23 @@ class FrankaZMQRobot(Robot):
                 obs[f"{name}.pos"] = float(state["ee_rotvec"][i])
             obs[f"{self.config.ee_names[6]}.pos"] = float(gripper_w)
         else:
-            # Joint space observation
+            # Joint space observation (7 joints + gripper, plus duplicate gripper for checkpoint compatibility)
             for i, joint in enumerate(self.config.joint_names[:7]):
                 obs[f"{joint}.pos"] = float(q[i])
             obs[f"{self.config.joint_names[7]}.pos"] = float(gripper_w)
+            # Add duplicate gripper value for checkpoint expecting 9 dims (7 joints + 2 gripper)
+            obs["gripper_duplicate.pos"] = float(gripper_w)
 
         # Camera images from local RealSense
         for cam_name, cam in self.cameras.items():
             obs[cam_name] = cam.async_read()
+
+        # if not self.config.obs_ee:
+        if "front_img" in obs:
+            obs["base_0_rgb"] = obs["front_img"]
+        if "wrist_img" in obs:
+            obs["left_wrist_0_rgb"] = obs["wrist_img"]
+            obs["right_wrist_0_rgb"] = obs["wrist_img"]
 
         return obs
 
@@ -371,9 +393,10 @@ class FrankaZMQRobot(Robot):
         self._close_zmq_socket()
         self._open_zmq_socket()
 
-    def _zmq_request(self, msg: dict, max_retries: int = 3) -> dict:
+    def _zmq_request(self, msg: dict) -> dict:
         """Send a JSON message and receive the reply, with reconnect on timeout."""
         import zmq
+        max_retries = max(1, int(self.config.zmq_max_retries))
         for attempt in range(max_retries):
             try:
                 self._zmq_socket.send_json(msg)
@@ -385,6 +408,8 @@ class FrankaZMQRobot(Robot):
                 )
                 if attempt < max_retries - 1:
                     self._reconnect_zmq()
+                    if self.config.zmq_retry_backoff_s > 0:
+                        time.sleep(self.config.zmq_retry_backoff_s)
         raise ConnectionError(
             f"franka_zmq_server not responding after {max_retries} attempts. "
             f"Is it running at {self.config.robot_server_address}:{self.config.robot_server_port}?"
