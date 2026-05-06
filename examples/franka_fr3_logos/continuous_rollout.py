@@ -135,6 +135,8 @@ def build_robot_config(args) -> FrankaFR3Config:
         dt=1.0 / args.fps,
         action_ee=args.action_ee,
         obs_ee=args.obs_ee,
+        action_delta=args.action_delta,
+        action_delta_scale=args.action_delta_scale,
     )
     if args.max_relative_target is not None:
         robot_config.max_relative_target = args.max_relative_target
@@ -164,6 +166,8 @@ def main():
     parser.add_argument("--robot_id", type=str, default="franka_fr3")
     parser.add_argument("--action_ee", action="store_true")
     parser.add_argument("--obs_ee", action="store_true")
+    parser.add_argument("--action_delta", action="store_true")
+    parser.add_argument("--action_delta_scale", type=float, default=1.0)
     parser.add_argument("--auto_loop", action="store_true",
                         help="Skip the start-button wait and roll out continuously.")
     parser.add_argument("--reset_wait_s", type=float, default=5.0,
