@@ -16,7 +16,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ---------------------------------------------------------------------------
-
+# python examples/franka_fr3_logos/deploy_robot_client.py \
+#     --interactive --action_ee --obs_ee \
+#     --policy_device cuda --max_relative_target 0.05 --fps 10
 import logging
 from functools import cached_property
 from pathlib import Path
@@ -290,6 +292,15 @@ class FrankaFR3(Robot):
                     f"Missing required end-effector pose components in action. "
                     f"Expected: {[f'{name}.pos' for name in self.config.ee_names]}"
                 )
+
+            if getattr(self.config, 'action_delta', False):
+                scale = getattr(self.config, 'action_delta_scale', 1.0)
+                x *= scale
+                y *= scale
+                z *= scale
+                wx *= scale
+                wy *= scale
+                wz *= scale
             
             # Build desired 4x4 transform from position + rotation vector (axis-angle)
             t_des = np.eye(4, dtype=float)
@@ -298,6 +309,12 @@ class FrankaFR3(Robot):
             
             # Use current joint positions as initial guess for IK (in degrees)
             q_curr = np.rad2deg(current_joint_positions[:7])
+            
+            if self.config.action_delta:
+                # 1. Get current EE pose via Forward Kinematics
+                ee_curr_transform = self.kinematics.forward_kinematics(q_curr)
+                # 2. Calculate absolute target pose (Current Pose @ Delta Pose)
+                t_des = ee_curr_transform @ t_des
             
             # Compute inverse kinematics (returns joint positions in degrees)
             q_target_deg = self.kinematics.inverse_kinematics(q_curr, t_des)
@@ -310,7 +327,12 @@ class FrankaFR3(Robot):
             for i, joint in enumerate(self.joint_names):
                 key = f"{joint}.pos"
                 if key in action:
-                    target_positions[i] = action[key]
+                    if self.config.action_delta and i < 7:
+                        # Apply delta to arm joints, but keep gripper as absolute
+                        scale = getattr(self.config, 'action_delta_scale', 1.0)
+                        target_positions[i] = current_joint_positions[i] + (action[key] * scale)
+                    else:
+                        target_positions[i] = action[key]
                 else:
                     # Keep current position if not specified
                     target_positions[i] = current_joint_positions[i]

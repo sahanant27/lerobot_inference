@@ -36,6 +36,8 @@ class FrankaFR3Config(RobotConfig):
     # End-effector space configuration
     action_ee: bool = False  # Whether to use end-effector space for actions
     obs_ee: bool = False     # Whether to use end-effector space for observations
+    action_delta: bool = False # Whether actions represent deltas relative to current state
+    action_delta_scale: float = 1.0 # Multiplier for delta actions to control speed (e.g. 0.5 for half speed)
     # EE state names (6-DOF axis angle + gripper)
     ee_names: list[str] = field(default_factory=lambda: [
         "x", "y", "z", "wx", "wy", "wz", "gripper"

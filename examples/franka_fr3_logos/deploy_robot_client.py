@@ -170,6 +170,17 @@ def main():
         action="store_true",
         help="Use end-effector space for observations"
     )
+    parser.add_argument(
+        "--action_delta",
+        action="store_true",
+        help="Treat actions as deltas relative to current state rather than absolute positions"
+    )
+    parser.add_argument(
+        "--action_delta_scale",
+        type=float,
+        default=1.0,
+        help="Multiplier for delta actions to control speed (e.g. 0.5 for half speed)"
+    )
     
     # Inference mode
     parser.add_argument(
@@ -275,7 +286,9 @@ def main():
         cameras=camera_configs,
         dt=1/args.fps,
         action_ee=args.action_ee,
-        obs_ee=args.obs_ee
+        obs_ee=args.obs_ee,
+        action_delta=args.action_delta,
+        action_delta_scale=args.action_delta_scale
     )
     
     # Add safety parameters if provided
@@ -287,7 +300,7 @@ def main():
     logger.info("Franka FR3 Policy Deployment Client")
     logger.info("="*70)
     logger.info(f"Robot ID: {robot_config.id}")
-    logger.info(f"Action Space: {'End-Effector (EE)' if args.action_ee else 'Joint Space'}")
+    logger.info(f"Action Space: {'End-Effector (EE)' if args.action_ee else 'Joint Space'} | Format: {'Delta' if args.action_delta else 'Absolute'}")
     logger.info(f"Observation Space: {'End-Effector (EE)' if args.obs_ee else 'Joint Space'}")
     logger.info(f"Policy Type: {args.policy_type.upper()}")
     logger.info(f"Policy Checkpoint: {checkpoint_path or 'Will be provided via command'}")
