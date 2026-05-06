@@ -128,9 +128,11 @@ class FrankaZMQRobot(Robot):
         # Cached from last get_observation to avoid extra round-trip in send_action
         self._last_q: np.ndarray | None = None
 
-        # Gripper hysteresis state
+        # Gripper hysteresis state. Initialize timer to construction time so the
+        # first close/open is gated by numb_duration (matches FrankaInterface on
+        # the main branch).
         self._is_grasped: bool = False
-        self._gripper_last_change_time: float = 0.0
+        self._gripper_last_change_time: float = time.monotonic()
 
         # Kinematics for client-side IK when action_ee=True. Server only ever
         # receives joint targets — EE → joint conversion happens here, mirroring
@@ -422,20 +424,23 @@ class FrankaZMQRobot(Robot):
             and elapsed > self.config.numb_duration
             and gripper_pos < close_thresh
         ):
-            self._zmq_gripper_move(width=0.0, speed=0.05)
+            # Closing uses force-controlled grasp (mirrors FrankaFR3.grasp_close).
+            self._zmq_gripper_grasp(width=0.0, speed=0.1, force=5.0,
+                                    epsilon_inner=0.08, epsilon_outer=0.08)
             self._is_grasped = True
             self._gripper_last_change_time = now
-            logger.info("Gripper: closing")
+            logger.info("Gripper: closing (grasp)")
 
         elif (
             self._is_grasped
             and elapsed > self.config.numb_duration
             and gripper_pos > open_thresh
         ):
+            # Opening uses position-only move (mirrors FrankaFR3.grasp_open).
             self._zmq_gripper_move(width=0.08, speed=0.1)
             self._is_grasped = False
             self._gripper_last_change_time = now
-            logger.info("Gripper: opening")
+            logger.info("Gripper: opening (move)")
 
     # ------------------------------------------------------------------
     # ZMQ helpers — all network I/O lives here
@@ -498,3 +503,20 @@ class FrankaZMQRobot(Robot):
 
     def _zmq_gripper_move(self, width: float, speed: float = 0.1) -> dict:
         return self._zmq_request({"type": "gripper_move", "width": width, "speed": speed})
+
+    def _zmq_gripper_grasp(
+        self,
+        width: float,
+        speed: float = 0.1,
+        force: float = 5.0,
+        epsilon_inner: float = 0.08,
+        epsilon_outer: float = 0.08,
+    ) -> dict:
+        return self._zmq_request({
+            "type": "gripper_grasp",
+            "width": width,
+            "speed": speed,
+            "force": force,
+            "epsilon_inner": epsilon_inner,
+            "epsilon_outer": epsilon_outer,
+        })
