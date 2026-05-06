@@ -38,12 +38,14 @@ import logging
 import time
 from dataclasses import dataclass, field
 from functools import cached_property
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from lerobot.cameras import CameraConfig
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.rotation import Rotation
 
 from ..config import RobotConfig
 from ..robot import Robot
@@ -85,6 +87,13 @@ class FrankaZMQConfig(RobotConfig):
     # Whether actions are EE targets (True) or joint position targets (False)
     action_ee: bool = False
 
+    # IK config (only used when action_ee=True). URDF path defaults to the bundled
+    # franka_fr3_kinematics.urdf next to this file.
+    urdf_path: str | None = None
+    ik_target_frame: str = "fr3_hand_tcp"
+    ik_position_weight: float = 1.0
+    ik_orientation_weight: float = 0.01
+
     # Camera configs (same as FrankaFR3Config)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
@@ -122,6 +131,27 @@ class FrankaZMQRobot(Robot):
         # Gripper hysteresis state
         self._is_grasped: bool = False
         self._gripper_last_change_time: float = 0.0
+
+        # Kinematics for client-side IK when action_ee=True. Server only ever
+        # receives joint targets — EE → joint conversion happens here, mirroring
+        # FrankaFR3 (main branch).
+        self.kinematics = None
+        if self.config.action_ee:
+            from lerobot.model.kinematics import RobotKinematics
+
+            urdf_path = self.config.urdf_path or str(
+                Path(__file__).parent / "franka_fr3_kinematics.urdf"
+            )
+            fk_joint_names = [f"fr3_joint{i}" for i in range(1, 8)]
+            self.kinematics = RobotKinematics(
+                urdf_path=urdf_path,
+                target_frame_name=self.config.ik_target_frame,
+                joint_names=fk_joint_names,
+            )
+            logger.info(
+                f"Initialized IK kinematics with URDF {urdf_path} "
+                f"(target_frame={self.config.ik_target_frame})"
+            )
 
     # ------------------------------------------------------------------
     # Feature descriptors (used by lerobot inference pipeline)
@@ -317,11 +347,53 @@ class FrankaZMQRobot(Robot):
         return sent
 
     def _send_action_ee(self, action: dict[str, Any]) -> dict[str, Any]:
-        # Forward raw policy output to the server. Whether values are absolute or delta
-        # is a controller concern configured on franka_zmq_server (--delta_ee flag).
+        # Solve IK locally and ship joint targets — the server only handles joint
+        # control. Mirrors FrankaFR3.send_action on the main branch.
+        if self.kinematics is None:
+            raise RuntimeError(
+                "action_ee=True but kinematics is not initialized. "
+                "This should never happen — check FrankaZMQRobot.__init__."
+            )
+
         pos = [float(action[f"{n}.pos"]) for n in self.config.ee_names[:3]]
         rotvec = [float(action[f"{n}.pos"]) for n in self.config.ee_names[3:6]]
-        self._zmq_set_ee_target(pos, rotvec)
+
+        t_des = np.eye(4, dtype=float)
+        t_des[:3, :3] = Rotation.from_rotvec(rotvec).as_matrix()
+        t_des[:3, 3] = pos
+
+        # Initial guess for IK: cached q from last observation, else fresh fetch.
+        if self._last_q is not None:
+            q_curr_rad = self._last_q.copy()
+        else:
+            q_curr_rad = np.array(self._zmq_get_state()["q"])
+
+        q_curr_deg = np.rad2deg(q_curr_rad[:7])
+        q_target_deg = self.kinematics.inverse_kinematics(
+            q_curr_deg,
+            t_des,
+            position_weight=self.config.ik_position_weight,
+            orientation_weight=self.config.ik_orientation_weight,
+        )
+        q_target_rad = np.deg2rad(np.asarray(q_target_deg, dtype=float))
+
+        # Apply the same per-joint safety clip used in joint-space mode.
+        if self.config.max_relative_target is not None:
+            if isinstance(self.config.max_relative_target, float):
+                delta = np.clip(
+                    q_target_rad - q_curr_rad[:7],
+                    -self.config.max_relative_target,
+                    self.config.max_relative_target,
+                )
+                q_target_rad = q_curr_rad[:7] + delta
+            elif isinstance(self.config.max_relative_target, dict):
+                for i, joint in enumerate(self.config.joint_names[:7]):
+                    if joint in self.config.max_relative_target:
+                        max_d = self.config.max_relative_target[joint]
+                        delta = np.clip(q_target_rad[i] - q_curr_rad[i], -max_d, max_d)
+                        q_target_rad[i] = q_curr_rad[i] + delta
+
+        self._zmq_set_target(q_target_rad.tolist())
 
         gripper_key = f"{self.config.ee_names[6]}.pos"
         gripper_pos = float(action.get(gripper_key, 0.08))
