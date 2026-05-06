@@ -33,10 +33,62 @@ from pathlib import Path
 
 import numpy as np
 import zmq
+from scipy.optimize import least_squares
 
 # Re-use the same kinematics + URDF the robot client uses, so behaviour matches.
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.utils.rotation import Rotation
+
+
+def solve_ik_scipy(
+    kin: RobotKinematics,
+    q_seed_rad: np.ndarray,
+    target_pose: np.ndarray,
+    max_iters: int = 50,
+    pos_tol: float = 1e-4,
+    seed_weight: float = 0.05,
+) -> np.ndarray:
+    """Local IK via scipy.least_squares — won't branch-jump.
+
+    Two key differences from placo's IK:
+      1. Damped-least-squares-style regularization: a small residual term
+         penalizes deviation from the seed, biasing the solver toward staying
+         close to the initial joint config. This is what placo's solver lacks.
+      2. method='trf' (Trust Region Reflective) handles m<n problems natively
+         (we have 6 pose residuals + 7 regularization residuals vs 7 vars; trf
+         is also fine when only the 6 pose residuals are used).
+
+    Args:
+        kin: RobotKinematics (used only for FK).
+        q_seed_rad: 7-DOF starting joint configuration in radians.
+        target_pose: 4x4 homogeneous transform of the desired EE pose.
+        seed_weight: regularization strength. 0 → behaves like raw FK-fit
+            (can branch-jump). 0.05 (default) → mild bias toward seed, still
+            tracks EE within sub-mm. 1.0 → strong bias, may not reach target
+            for large Cartesian moves.
+    Returns:
+        7-DOF joint configuration in radians.
+    """
+    target_R = target_pose[:3, :3]
+    target_p = target_pose[:3, 3]
+
+    def residual(q_rad: np.ndarray) -> np.ndarray:
+        T = kin.forward_kinematics(np.rad2deg(q_rad))
+        pos_err = T[:3, 3] - target_p
+        # Orientation error: axis-angle of T_R · target_R^T → 0 when aligned.
+        R_err = T[:3, :3] @ target_R.T
+        rotvec_err = Rotation.from_matrix(R_err).as_rotvec()
+        # Stay-close-to-seed regularization (small weight so it doesn't
+        # dominate the pose tracking, big enough to reject far branches).
+        seed_err = seed_weight * (q_rad - q_seed_rad)
+        return np.concatenate([pos_err, rotvec_err, seed_err])
+
+    result = least_squares(
+        residual, q_seed_rad, method="trf",
+        max_nfev=max_iters * len(q_seed_rad),
+        xtol=pos_tol, ftol=pos_tol,
+    )
+    return np.asarray(result.x, dtype=float)
 
 
 URDF_PATH = (
@@ -81,6 +133,29 @@ def main():
              "Allowed: 'close', 'open'. Example: '--gripper close,open' will "
              "grasp before the motion and release after.",
     )
+    parser.add_argument(
+        "--ik_position_weight", type=float, default=1.0,
+        help="placo IK position-task weight.",
+    )
+    parser.add_argument(
+        "--ik_orientation_weight", type=float, default=1.0,
+        help="placo IK orientation-task weight. Low values let the wrist swing "
+             "freely to hit the position; raise to lock orientation. Default 1.0 "
+             "(equal weight) is a sane starting point — main's 0.01 is very "
+             "position-dominant and can land in surprising joint configurations.",
+    )
+    parser.add_argument(
+        "--max_joint_delta", type=float, default=0.5,
+        help="Reject IK solutions whose largest per-joint change from the start "
+             "exceeds this many radians (~28°). Catches IK jumping to a far "
+             "branch instead of tracking the small Cartesian delta.",
+    )
+    parser.add_argument(
+        "--ik_method", choices=["scipy", "placo"], default="scipy",
+        help="IK backend. scipy: Levenberg-Marquardt local solver (won't "
+             "branch-jump). placo: lerobot's RobotKinematics.inverse_kinematics "
+             "(no seed regularization — can jump branches even for small deltas).",
+    )
     args = parser.parse_args()
 
     actions = [a.strip() for a in args.gripper.split(",") if a.strip()]
@@ -122,9 +197,49 @@ def main():
 
         # 3. Solve IK once (target is constant for this test).
         kin = build_kinematics()
-        q_target_deg = kin.inverse_kinematics(np.rad2deg(q0_rad[:7]), t_des)
-        q_target_rad = np.deg2rad(np.asarray(q_target_deg, dtype=float))
-        print(f"IK solved -> joint target (rad): {q_target_rad}")
+        q_curr_deg = np.rad2deg(q0_rad[:7])
+
+        if args.ik_method == "scipy":
+            q_target_rad = solve_ik_scipy(kin, q0_rad[:7], t_des)
+            q_target_deg = np.rad2deg(q_target_rad)
+        else:
+            q_target_deg = kin.inverse_kinematics(
+                q_curr_deg, t_des,
+                position_weight=args.ik_position_weight,
+                orientation_weight=args.ik_orientation_weight,
+            )
+            q_target_deg = np.asarray(q_target_deg, dtype=float)
+            q_target_rad = np.deg2rad(q_target_deg)
+
+        # FK round-trip: where does the IK solution actually place the EE?
+        ee_after_ik = kin.forward_kinematics(q_target_deg)
+        ik_pos = ee_after_ik[:3, 3]
+        pos_err = np.linalg.norm(ik_pos - target_pos)
+        z_err = ik_pos[2] - target_pos[2]
+        q_delta_deg = q_target_deg - q_curr_deg
+
+        print(f"--- IK diagnostics ({args.ik_method}) ---")
+        print(f"  start  EE pos       : {ee_pos}")
+        print(f"  target EE pos       : {target_pos}  (delta = {delta})")
+        print(f"  FK(IK) EE pos       : {ik_pos}")
+        print(f"  position error norm : {pos_err:.4f} m  (Z err: {z_err:+.4f} m)")
+        print(f"  per-joint Δ (deg)   : {np.round(q_delta_deg, 2)}")
+        print(f"  max |Δ| (rad)       : {np.max(np.abs(np.deg2rad(q_delta_deg))):.3f}")
+
+        max_delta_rad = float(np.max(np.abs(np.deg2rad(q_delta_deg))))
+        if max_delta_rad > args.max_joint_delta:
+            raise SystemExit(
+                f"IK solution moves a joint by {max_delta_rad:.3f} rad "
+                f"(> --max_joint_delta {args.max_joint_delta}). "
+                "Aborting before sending the target — this is almost certainly "
+                "placo jumping to a far IK branch. Try --ik_orientation_weight 5 "
+                "or higher, or reduce the EE delta."
+            )
+        if pos_err > 0.01:
+            print(
+                f"  WARNING: IK position error {pos_err*1000:.1f} mm exceeds 10 mm — "
+                "solver did not converge well. Targets sent to robot anyway."
+            )
 
         # 4. Optional: pre-motion gripper close.
         if "close" in actions:
