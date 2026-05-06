@@ -49,7 +49,8 @@ Example (sync):
 Example (with end-effector control):
     python deploy_robot_client.py \
         --use_sync_inference \
-        --use_ee \
+        --action_ee \
+        --obs_ee \
         --checkpoint_path outputs/train/diffusion_franka_fr3_ee_softtoy/checkpoints/last/pretrained_model \
         --policy_type diffusion \
         --task "pick and place task" \
@@ -160,9 +161,14 @@ def main():
     
     # Robot control space
     parser.add_argument(
-        "--use_ee",
+        "--action_ee",
         action="store_true",
-        help="Use end-effector space instead of joint space (for policies trained on EE datasets)"
+        help="Use end-effector space for actions"
+    )
+    parser.add_argument(
+        "--obs_ee",
+        action="store_true",
+        help="Use end-effector space for observations"
     )
     
     # Inference mode
@@ -268,7 +274,8 @@ def main():
         id=args.robot_id,
         cameras=camera_configs,
         dt=1/args.fps,
-        use_ee=args.use_ee
+        action_ee=args.action_ee,
+        obs_ee=args.obs_ee
     )
     
     # Add safety parameters if provided
@@ -280,7 +287,8 @@ def main():
     logger.info("Franka FR3 Policy Deployment Client")
     logger.info("="*70)
     logger.info(f"Robot ID: {robot_config.id}")
-    logger.info(f"Control Space: {'End-Effector (EE)' if args.use_ee else 'Joint Space'}")
+    logger.info(f"Action Space: {'End-Effector (EE)' if args.action_ee else 'Joint Space'}")
+    logger.info(f"Observation Space: {'End-Effector (EE)' if args.obs_ee else 'Joint Space'}")
     logger.info(f"Policy Type: {args.policy_type.upper()}")
     logger.info(f"Policy Checkpoint: {checkpoint_path or 'Will be provided via command'}")
     logger.info(f"Policy Device: {args.policy_device}")
@@ -582,8 +590,26 @@ def run_sync_inference(robot_config, checkpoint_path, args, logger, stop_event=N
         logger.info("Robot connected!")
         action_features = hw_to_dataset_features(robot.action_features, ACTION)
         obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
+        
+        # --- Patch dataset features to rename cameras and make state 9-dim ---
+        if "observation.state" in obs_features:
+            names = obs_features["observation.state"]["names"]
+            if "gripper.pos" in names and "gripper_duplicate.pos" not in names:
+                names.append("gripper_duplicate.pos")
+                obs_features["observation.state"]["shape"] = (len(names),)
+
+        if "observation.images.front_img" in obs_features:
+            obs_features["observation.images.base_0_rgb"] = obs_features.pop("observation.images.front_img")
+            
+        if "observation.images.wrist_img" in obs_features:
+            feat = obs_features.pop("observation.images.wrist_img")
+            import copy
+            obs_features["observation.images.left_wrist_0_rgb"] = copy.deepcopy(feat)
+            obs_features["observation.images.right_wrist_0_rgb"] = copy.deepcopy(feat)
+        # ---------------------------------------------------------------------
+        
         dataset_features = {**action_features, **obs_features}
-    
+
     # Override n_action_steps with args.actions_per_chunk 
     if hasattr(policy.config, 'n_action_steps'):
         original_n_action_steps = policy.config.n_action_steps
@@ -603,6 +629,19 @@ def run_sync_inference(robot_config, checkpoint_path, args, logger, stop_event=N
             start_time = time.perf_counter()
             
             obs = robot.get_observation()
+            
+            # --- Apply patches for 9-dim state and renamed cameras ---
+            if "gripper.pos" in obs:
+                obs["gripper_duplicate.pos"] = obs["gripper.pos"]
+                
+            if "front_img" in obs:
+                obs["base_0_rgb"] = obs.pop("front_img")
+                
+            if "wrist_img" in obs:
+                obs["left_wrist_0_rgb"] = obs["wrist_img"]
+                obs["right_wrist_0_rgb"] = obs.pop("wrist_img")
+            # ---------------------------------------------------------
+            
             obs_frame = build_inference_frame(
                     observation=obs, task=args.task, ds_features=dataset_features, device=device
                 )
@@ -611,6 +650,9 @@ def run_sync_inference(robot_config, checkpoint_path, args, logger, stop_event=N
             action = policy.select_action(obs)
             action = postprocess(action)
             action = make_robot_action(action, dataset_features)
+            
+            # Debug: print the generated action keys/values
+            logger.info(f"[Step {step}] Action: {action}")
             
             robot.send_action(action)
             

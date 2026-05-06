@@ -34,7 +34,8 @@ class FrankaFR3Config(RobotConfig):
     ])
     
     # End-effector space configuration
-    use_ee: bool = False  # Whether to use end-effector space instead of joint space
+    action_ee: bool = False  # Whether to use end-effector space for actions
+    obs_ee: bool = False     # Whether to use end-effector space for observations
     # EE state names (6-DOF axis angle + gripper)
     ee_names: list[str] = field(default_factory=lambda: [
         "x", "y", "z", "wx", "wy", "wz", "gripper"

@@ -59,9 +59,9 @@ class FrankaFR3(Robot):
         # ROS2 interface (initialized on connect)
         self.franka_interface = None
         
-        # Kinematics for end-effector control (initialized if use_ee=True)
+        # Kinematics for end-effector control (initialized if action_ee=True or obs_ee=True)
         self.kinematics = None
-        if config.use_ee:
+        if config.action_ee or config.obs_ee:
             # Get URDF path from robot package directory
             urdf_path = Path(__file__).parent / "franka_fr3_kinematics.urdf"
             # Joint names for FK/IK (excluding gripper)
@@ -77,9 +77,19 @@ class FrankaFR3(Robot):
             logger.info(f"Initialized kinematics for end-effector control with URDF: {urdf_path}")
         
     @property
-    def _motors_ft(self) -> dict[str, type]:
-        """Feature types for motor positions"""
-        if self.config.use_ee:
+    def _motor_obs_ft(self) -> dict[str, type]:
+        """Feature types for motor observation positions"""
+        if self.config.obs_ee:
+            # End-effector space
+            return {f"{name}.pos": float for name in self.config.ee_names}
+        else:
+            # Joint space
+            return {f"{joint}.pos": float for joint in self.joint_names}
+
+    @property
+    def _motor_action_ft(self) -> dict[str, type]:
+        """Feature types for motor action targets"""
+        if self.config.action_ee:
             # End-effector space
             return {f"{name}.pos": float for name in self.config.ee_names}
         else:
@@ -100,7 +110,7 @@ class FrankaFR3(Robot):
         Observation features combining joint positions and camera feeds.
         Returns dictionary mapping feature names to their types/shapes.
         """
-        return {**self._motors_ft, **self._cameras_ft}
+        return {**self._motor_obs_ft, **self._cameras_ft}
 
     @cached_property  
     def action_features(self) -> dict[str, type]:
@@ -108,7 +118,7 @@ class FrankaFR3(Robot):
         Action features for robot control.
         Returns dictionary mapping action names to their types.
         """
-        return self._motors_ft
+        return self._motor_action_ft
 
     @property
     def is_connected(self) -> bool:
@@ -193,7 +203,7 @@ class FrankaFR3(Robot):
         Get current observation from the robot.
         
         Returns:
-            Dictionary containing joint positions (or EE pose if use_ee=True) and camera images
+            Dictionary containing joint positions (or EE pose if obs_ee=True) and camera images
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected")
@@ -205,8 +215,8 @@ class FrankaFR3(Robot):
         if joint_positions is None:
             raise RuntimeError("No joint positions available from Franka interface")
         
-        # Convert to EE pose if use_ee is enabled
-        if self.config.use_ee:
+        # Convert to EE pose if obs_ee is enabled
+        if self.config.obs_ee:
             # Extract arm joint positions (first 7 joints, in radians)
             arm_joints = joint_positions[:7]
             gripper_pos = joint_positions[7]
@@ -247,7 +257,7 @@ class FrankaFR3(Robot):
         Send action to the robot.
         
         Args:
-            action: Dictionary containing target joint positions (or EE pose if use_ee=True)
+            action: Dictionary containing target joint positions (or EE pose if action_ee=True)
             
         Returns:
             Dictionary containing the actual action sent (potentially clipped)
@@ -264,7 +274,7 @@ class FrankaFR3(Robot):
         # Extract target positions
         target_positions = np.zeros(8)
         
-        if self.config.use_ee:
+        if self.config.action_ee:
             # EE space - convert EE pose to joint positions using inverse kinematics
             # Extract EE pose from action
             x = action.get(f"{self.config.ee_names[0]}.pos", None)
@@ -332,7 +342,7 @@ class FrankaFR3(Robot):
         
         # Return the actual action sent (in the same format as the input)
         sent_action = {}
-        if self.config.use_ee:
+        if self.config.action_ee:
             # Convert joint positions back to EE pose for return value
             ee_transform = self.kinematics.forward_kinematics(np.rad2deg(target_positions[:7]))
             pos = ee_transform[:3, 3]
